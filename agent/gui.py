@@ -24,6 +24,7 @@ from agent.session_manager import (
 
 INVALID_FILENAME_CHARS = r'\/:*?"<>|'
 
+
 class CodingAgentApp:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -75,7 +76,6 @@ class CodingAgentApp:
         row_id = self.file_tree.identify_row(event.y)
         if row_id:
             self.file_tree.selection_set(row_id)
-            item_text = self.file_tree.item(row_id, "text")
             rel_path = self.file_tree.item(row_id)["values"][0]
             candidate = WORKSPACE / rel_path
             if candidate.is_dir():
@@ -193,7 +193,6 @@ class CodingAgentApp:
         rel_path = self.file_tree.item(item_id)["values"][0]
         abs_src = WORKSPACE / rel_path
         old_name = abs_src.name
-
         new_name = simpledialog.askstring("重命名", "输入新名称：", initialvalue=old_name)
         if new_name is None:
             return
@@ -206,7 +205,6 @@ class CodingAgentApp:
             if c in new_name:
                 messagebox.showerror("错误", f"名称不能包含字符 {repr(c)}")
                 return
-
         abs_dst = abs_src.parent / new_name
         # 沙箱校验
         try:
@@ -252,6 +250,8 @@ class CodingAgentApp:
             return
         self.append_chat(f"[系统] 会话重命名：{old_title} → {new_title}")
         self.refresh_session_list()
+        # 重命名后保持选中当前会话
+        self._select_session_by_id(sid)
 
     def delete_selected_folder(self):
         """GUI手动删除选中文件夹（递归删除全部内容，仅右键可用，AI工具不开放）"""
@@ -371,9 +371,19 @@ class CodingAgentApp:
         except OSError as e:
             messagebox.showerror("创建失败", str(e))
 
+    def _select_session_by_id(self, session_id: str):
+        """内部工具：根据session_id在treeview中定位并选中条目"""
+        for item in self.session_tree.get_children():
+            vals = self.session_tree.item(item, "values")
+            if vals and vals[0] == session_id:
+                self.session_tree.selection_set(item)
+                self.session_tree.focus(item)
+                return
+
     # ==================== ✅会话相关函数 ====================
     def refresh_session_list(self):
-        """刷新会话列表UI，展示会话标题"""
+        """刷新会话列表UI，展示会话标题，刷新后保留当前会话选中"""
+        old_current = self.current_session_id
         self.session_tree.delete(*self.session_tree.get_children())
         sessions = list_sessions()
         for s in sessions:
@@ -385,15 +395,22 @@ class CodingAgentApp:
                 text=disp_title,
                 values=(sid,)
             )
+        # 刷新完，重新选中当前正在使用的会话
+        if old_current is not None:
+            self._select_session_by_id(old_current)
 
     def new_session(self):
-        """新建会话，清空聊天，此时不写入磁盘，第一条任务执行才持久化"""
+        """新建会话：立刻写入磁盘，列表马上可见，自动选中"""
         self.current_session_id = new_session_id()
         self.chat_view.configure(state=tk.NORMAL)
         self.chat_view.delete("1.0", tk.END)
         self.chat_view.configure(state=tk.DISABLED)
         self.append_chat(f"[系统] 创建新会话")
+        # 关键点：新建会话立刻写入磁盘，空messages，临时标题，不用等到第一次交互
+        save_session(self.current_session_id, messages=[], title="新会话")
         self.refresh_session_list()
+        # 新建完成，高亮选中刚创建的会话
+        self._select_session_by_id(self.current_session_id)
 
     def on_session_selected(self, event=None):
         """选中会话，加载历史消息，UI跳过system消息，底层消息完整保留给Agent"""
@@ -437,7 +454,7 @@ class CodingAgentApp:
         if not ok:
             return
         delete_session(sid)
-        # 如果删除的是当前正在使用的会话，清空聊天界面
+        # 如果删除的是当前正在使用的会话，清空标记
         if self.current_session_id == sid:
             self.current_session_id = None
             self.chat_view.configure(state=tk.NORMAL)
@@ -658,15 +675,10 @@ class CodingAgentApp:
                 messages=history_msgs
             )
             result = agent.run(task)
-            # ✅新增：新会话，生成标题保存
-            if self.current_session_id is None:
-                self.current_session_id = new_session_id()
-                # 从messages提取标题
+            # 运行交互之后，更新会话标题，用第一条用户消息替换临时的“新会话”
+            if self.current_session_id is not None:
                 title = self.make_title_from_messages(agent.messages)
                 save_session(self.current_session_id, agent.messages, title=title)
-            else:
-                # 已有会话，沿用旧title
-                save_session(self.current_session_id, agent.messages)
             self.events.put(("result", result))
         except Exception as exc:
             self.events.put(("error", str(exc)))
@@ -701,6 +713,7 @@ class CodingAgentApp:
                     self.append_chat("\n[最终结果]")
                     self.append_markdown(content)
                     self.refresh_files()
+                    self.refresh_session_list()
                 elif event_type == "error":
                     self.append_chat("[错误] " + content)
                     messagebox.showerror("Agent 错误", content)
