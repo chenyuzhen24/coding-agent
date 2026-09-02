@@ -1,10 +1,11 @@
 import json
 import os
+import shutil
 import queue
 import threading
 import tkinter as tk
 from pathlib import Path
-from tkinter import messagebox, ttk
+from tkinter import messagebox, ttk, simpledialog
 from tkinter.scrolledtext import ScrolledText
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -17,9 +18,11 @@ from agent.session_manager import (
     save_session,
     load_session,
     delete_session,
+    rename_session,
     new_session_id
 )
 
+INVALID_FILENAME_CHARS = r'\/:*?"<>|'
 
 class CodingAgentApp:
     def __init__(self, root: tk.Tk):
@@ -39,9 +42,58 @@ class CodingAgentApp:
         self.chat_view.tag_configure("code", font=("Consolas", 9), background="#eeeeee")
         self.chat_view.tag_configure("normal", font=("Consolas", 10))
 
+        # ========== 文件树右键菜单 ==========
+        self.file_tree_menu = tk.Menu(self.root, tearoff=0)
+        self.file_tree_menu.add_command(label="新建文件", command=self.create_new_file_dialog)
+        self.file_tree_menu.add_command(label="新建文件夹", command=self.create_new_folder_dialog)
+        self.file_tree_menu.add_separator()
+        self.file_tree_menu.add_command(label="重命名", command=self.rename_file_or_folder)
+        self.file_tree_menu.add_separator()
+        self.file_tree_menu.add_command(label="刷新文件列表", command=self.refresh_files)
+        self.file_tree_menu.add_separator()
+        self.file_tree_menu.add_command(label="删除选中文件", command=self.delete_current_file)
+        self.file_tree_menu.add_command(label="删除选中文件夹", command=self.delete_selected_folder)
+        self.file_tree.bind("<Button-3>", self.on_file_tree_right_click)
+
+        # ========== 会话列表右键菜单 ==========
+        self.session_tree_menu = tk.Menu(self.root, tearoff=0)
+        self.session_tree_menu.add_command(label="新建会话", command=self.new_session)
+        self.session_tree_menu.add_command(label="重命名会话", command=self.rename_selected_session)
+        self.session_tree_menu.add_command(label="刷新会话列表", command=self.refresh_session_list)
+        self.session_tree_menu.add_separator()
+        self.session_tree_menu.add_command(label="删除选中会话", command=self.remove_selected_session)
+        self.session_tree.bind("<Button-3>", self.on_session_tree_right_click)
+
+        self._context_click_folder: str | None = None  # 右键点击的文件夹路径
         self.refresh_files()
         self.refresh_session_list()
         self.poll_events()
+
+    def on_file_tree_right_click(self, event):
+        """文件树鼠标右键弹出菜单；记录点击的文件夹路径给新建文件/文件夹使用"""
+        self._context_click_folder = None
+        row_id = self.file_tree.identify_row(event.y)
+        if row_id:
+            self.file_tree.selection_set(row_id)
+            item_text = self.file_tree.item(row_id, "text")
+            rel_path = self.file_tree.item(row_id)["values"][0]
+            candidate = WORKSPACE / rel_path
+            if candidate.is_dir():
+                self._context_click_folder = rel_path
+        try:
+            self.file_tree_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.file_tree_menu.grab_release()
+
+    def on_session_tree_right_click(self, event):
+        """会话列表鼠标右键：先选中点击行，再弹出菜单"""
+        row_id = self.session_tree.identify_row(event.y)
+        if row_id:
+            self.session_tree.selection_set(row_id)
+        try:
+            self.session_tree_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.session_tree_menu.grab_release()
 
     def make_title_from_messages(self, messages: list[dict]) -> str:
         """从消息列表取第一条用户提问，生成会话标题，最多22字符"""
@@ -73,25 +125,19 @@ class CodingAgentApp:
         # ============ Workspace 文件【放到上方】 ============
         ttk.Label(left, text="Workspace 文件").pack(anchor=tk.W)
         self.file_tree = ttk.Treeview(left, show="tree")
+        style = ttk.Style()
+        style.configure("Treeview", rowheight=22, font=("Consolas", 9))
+        style.configure("Treeview.Item", padding=(2, 2))
         self.file_tree.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
         self.file_tree.bind("<<TreeviewSelect>>", self.on_file_selected)
-        ttk.Button(
-            left,
-            text="刷新文件",
-            command=self.refresh_files,
-        ).pack(fill=tk.X, pady=(8, 0))
+        # ---【已移除文件操作按钮frame，全部改用右键】---
 
         # ============ ✅会话面板【移到下方】 ============
         ttk.Label(left, text="会话列表").pack(anchor=tk.W, pady=(12, 0))
         self.session_tree = ttk.Treeview(left, show="tree")
         self.session_tree.pack(fill=tk.BOTH, expand=False, pady=(8, 0))
         self.session_tree.bind("<<TreeviewSelect>>", self.on_session_selected)
-        session_btn_frame = ttk.Frame(left)
-        session_btn_frame.pack(fill=tk.X, pady=(4, 8))
-        ttk.Button(session_btn_frame, text="新建会话", command=self.new_session).pack(side=tk.LEFT, fill=tk.X, expand=True)
-        ttk.Button(session_btn_frame, text="刷新会话", command=self.refresh_session_list).pack(side=tk.LEFT, fill=tk.X, expand=True)
-        ttk.Button(session_btn_frame, text="删除会话", command=self.remove_selected_session).pack(side=tk.RIGHT, fill=tk.X, expand=True)
-        # ============ 会话面板结束 ============
+        # ---【已移除会话操作按钮frame，全部改用右键】---
 
         center_toolbar = ttk.Frame(center)
         center_toolbar.pack(fill=tk.X)
@@ -102,15 +148,10 @@ class CodingAgentApp:
         self.file_label.pack(side=tk.LEFT)
         ttk.Button(
             center_toolbar,
-            text="删除文件",
-            command=self.delete_current_file,
-        ).pack(side=tk.RIGHT, padx=(8, 0))
-
-        ttk.Button(
-            center_toolbar,
             text="保存文件",
             command=self.save_file,
         ).pack(side=tk.RIGHT)
+
         self.code_editor = ScrolledText(
             center,
             wrap=tk.NONE,
@@ -118,6 +159,7 @@ class CodingAgentApp:
             font=("Consolas", 11),
         )
         self.code_editor.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+
         ttk.Label(right, text="AI Agent").pack(anchor=tk.W)
         self.chat_view = ScrolledText(
             right,
@@ -126,6 +168,7 @@ class CodingAgentApp:
             font=("Consolas", 10),
         )
         self.chat_view.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+
         ttk.Label(right, text="编程任务").pack(anchor=tk.W, pady=(8, 4))
         self.task_input = tk.Text(
             right,
@@ -140,7 +183,195 @@ class CodingAgentApp:
         )
         self.run_button.pack(fill=tk.X, pady=(8, 0))
 
-    # ==================== ✅会话相关函数【新增】 ====================
+    def rename_file_or_folder(self):
+        """重命名选中文件/文件夹"""
+        sel = self.file_tree.selection()
+        if not sel:
+            messagebox.showinfo("提示", "请先选中文件或文件夹")
+            return
+        item_id = sel[0]
+        rel_path = self.file_tree.item(item_id)["values"][0]
+        abs_src = WORKSPACE / rel_path
+        old_name = abs_src.name
+
+        new_name = simpledialog.askstring("重命名", "输入新名称：", initialvalue=old_name)
+        if new_name is None:
+            return
+        new_name = new_name.strip()
+        if not new_name:
+            messagebox.showwarning("提示", "名称不能为空")
+            return
+        # 校验windows非法字符
+        for c in INVALID_FILENAME_CHARS:
+            if c in new_name:
+                messagebox.showerror("错误", f"名称不能包含字符 {repr(c)}")
+                return
+
+        abs_dst = abs_src.parent / new_name
+        # 沙箱校验
+        try:
+            abs_dst.resolve().relative_to(WORKSPACE.resolve())
+        except ValueError:
+            messagebox.showerror("错误", "非法路径，禁止跳出workspace")
+            return
+        if abs_dst.exists():
+            messagebox.showerror("错误", f"名称已存在：{new_name}")
+            return
+        try:
+            abs_src.rename(abs_dst)
+            self.append_chat(f"[界面] 重命名 {rel_path} → {abs_dst.relative_to(WORKSPACE)}")
+            # 如果当前打开的就是该文件，更新current_file
+            if self.current_file is not None:
+                curr_abs = WORKSPACE / self.current_file
+                if curr_abs.resolve() == abs_src.resolve():
+                    self.current_file = str(abs_dst.relative_to(WORKSPACE))
+                    self.file_label.configure(text=self.current_file)
+            self.refresh_files()
+        except OSError as e:
+            messagebox.showerror("重命名失败", str(e))
+
+    def rename_selected_session(self):
+        """重命名选中会话"""
+        sel = self.session_tree.selection()
+        if not sel:
+            messagebox.showinfo("提示", "请先选中会话")
+            return
+        item_id = sel[0]
+        sid = self.session_tree.item(item_id)["values"][0]
+        old_title = self.session_tree.item(item_id)["text"]
+        new_title = simpledialog.askstring("重命名会话", "输入会话新标题：", initialvalue=old_title)
+        if new_title is None:
+            return
+        new_title = new_title.strip()
+        if not new_title:
+            messagebox.showwarning("提示", "标题不能为空")
+            return
+        ok = rename_session(sid, new_title)
+        if not ok:
+            messagebox.showerror("错误", "重命名会话失败")
+            return
+        self.append_chat(f"[系统] 会话重命名：{old_title} → {new_title}")
+        self.refresh_session_list()
+
+    def delete_selected_folder(self):
+        """GUI手动删除选中文件夹（递归删除全部内容，仅右键可用，AI工具不开放）"""
+        sel = self.file_tree.selection()
+        if not sel:
+            messagebox.showinfo("提示", "请先选中一个文件夹")
+            return
+        item_id = sel[0]
+        rel_path = self.file_tree.item(item_id)["values"][0]
+        target_path = WORKSPACE / rel_path
+        # 校验：必须是文件夹，不能删除workspace根目录，不能越界
+        if not target_path.is_dir():
+            messagebox.showerror("错误", "选中项不是文件夹，请选中文件夹再执行")
+            return
+        if target_path.resolve() == WORKSPACE.resolve():
+            messagebox.showerror("禁止操作", "不允许删除 workspace 根目录")
+            return
+        try:
+            target_path.resolve().relative_to(WORKSPACE.resolve())
+        except ValueError:
+            messagebox.showerror("错误", "非法路径，禁止访问workspace外部")
+            return
+
+        ok = messagebox.askyesno(
+            "⚠️ 确认删除文件夹",
+            f"即将递归删除文件夹：workspace\\{rel_path}\n\n"
+            "文件夹内部所有文件、子文件夹都会被永久删除，无法恢复！\n确定继续吗？"
+        )
+        if not ok:
+            return
+        try:
+            shutil.rmtree(target_path)
+            self.append_chat(f"[界面] 手动删除文件夹 {rel_path}")
+            # 如果当前打开的文件属于被删除目录，清空编辑器
+            if self.current_file is not None:
+                curr_abs = (WORKSPACE / self.current_file).resolve()
+                if str(curr_abs).startswith(str(target_path.resolve())):
+                    self.current_file = None
+                    self.file_label.configure(text="未选择文件")
+                    self.code_editor.delete("1.0", tk.END)
+            self.refresh_files()
+        except OSError as e:
+            messagebox.showerror("删除文件夹失败", str(e))
+
+    def create_new_folder_dialog(self):
+        """手动新建文件夹弹窗，若右键选中文件夹，默认路径为该目录"""
+        initial_val = ""
+        if self._context_click_folder is not None:
+            initial_val = f"{self._context_click_folder}/"
+        rel_path = simpledialog.askstring(
+            "新建文件夹",
+            "输入相对于 workspace 的文件夹路径：\n示例：src 或者 utils/common",
+            initialvalue=initial_val
+        )
+        if rel_path is None:
+            return
+        rel_path = rel_path.strip()
+        if not rel_path:
+            messagebox.showwarning("提示", "文件夹路径不能为空")
+            return
+        # 安全路径校验，防止跳出workspace
+        try:
+            candidate = (WORKSPACE / rel_path).resolve()
+            workspace_root = WORKSPACE.resolve()
+            candidate.relative_to(workspace_root)
+        except ValueError:
+            messagebox.showerror("错误", "非法路径，不允许访问workspace外部")
+            return
+
+        if candidate.exists():
+            messagebox.showerror("错误", f"路径已存在：{rel_path}")
+            return
+        try:
+            candidate.mkdir(parents=True, exist_ok=False)
+            self.append_chat(f"[界面] 手动新建文件夹 {rel_path}")
+            self.refresh_files()
+        except OSError as e:
+            messagebox.showerror("创建文件夹失败", str(e))
+
+    def create_new_file_dialog(self):
+        """手动新建文件弹窗；右键选中文件夹时，输入框默认填充该文件夹路径"""
+        initial_val = ""
+        if self._context_click_folder is not None:
+            initial_val = f"{self._context_click_folder}/"
+        rel_path = simpledialog.askstring(
+            "新建文件",
+            "输入相对于 workspace 的文件路径：\n示例：main.py 或者 utils/helper.py",
+            initialvalue=initial_val
+        )
+        if rel_path is None:
+            return
+        rel_path = rel_path.strip()
+        if not rel_path:
+            messagebox.showwarning("提示", "文件路径不能为空")
+            return
+        # 安全路径校验，防止跳出workspace
+        try:
+            candidate = (WORKSPACE / rel_path).resolve()
+            workspace_root = WORKSPACE.resolve()
+            candidate.relative_to(workspace_root)
+        except ValueError:
+            messagebox.showerror("错误", "非法路径，不允许访问workspace外部")
+            return
+
+        if candidate.exists():
+            messagebox.showerror("错误", f"文件已存在：{rel_path}")
+            return
+        try:
+            candidate.parent.mkdir(parents=True, exist_ok=True)
+            candidate.write_text("", encoding="utf-8")
+            self.append_chat(f"[界面] 手动新建文件 {rel_path}")
+            self.refresh_files()
+            # 创建完成自动打开该文件到编辑器
+            self.current_file = rel_path
+            self.file_label.configure(text=rel_path)
+            self.code_editor.delete("1.0", tk.END)
+        except OSError as e:
+            messagebox.showerror("创建失败", str(e))
+
+    # ==================== ✅会话相关函数 ====================
     def refresh_session_list(self):
         """刷新会话列表UI，展示会话标题"""
         self.session_tree.delete(*self.session_tree.get_children())
@@ -215,7 +446,7 @@ class CodingAgentApp:
         self.refresh_session_list()
         self.append_chat(f"[系统] 删除会话 {sid}")
 
-    # ==================== 原有函数，修改run_agent部分 ====================
+    # ==================== 文件操作 ====================
     def delete_current_file(self):
         if not self.current_file:
             messagebox.showinfo("提示", "请先选择文件。")
@@ -301,32 +532,41 @@ class CodingAgentApp:
         self.file_tree.delete(*self.file_tree.get_children())
         if not WORKSPACE.exists():
             WORKSPACE.mkdir(parents=True)
+        node_map = {}
+        root_id = ""
         for path in sorted(WORKSPACE.rglob("*")):
-            if not path.is_file():
-                continue
             relative = path.relative_to(WORKSPACE)
-            if any(
-                part in {".git", ".venv", "__pycache__", "node_modules"}
-                for part in relative.parts
-            ):
+            if any(part in {".git", ".venv", "__pycache__", "node_modules"} for part in relative.parts):
                 continue
-            self.file_tree.insert(
-                "",
-                tk.END,
-                iid=str(relative),
-                text=str(relative),
-            )
+            parts = list(relative.parts)
+            parent_id = root_id
+            current_rel = Path()
+            for idx, part in enumerate(parts):
+                current_rel = current_rel / part
+                node_key = str(current_rel)
+                if node_key not in node_map:
+                    if idx == len(parts) - 1 and path.is_file():
+                        iid = self.file_tree.insert(parent_id, tk.END, iid=node_key, text=f"📄 {part}", values=(str(current_rel),))
+                    else:
+                        iid = self.file_tree.insert(parent_id, tk.END, iid=node_key, text=f"📁 {part}", values=(str(current_rel),))
+                        node_map[node_key] = iid
+                parent_id = node_map[node_key] if node_key in node_map else parent_id
 
     def on_file_selected(self, _event=None):
         selection = self.file_tree.selection()
         if not selection:
             return
-        relative_path = selection[0]
+        item_id = selection[0]
+        # 如果点击的是文件夹，直接返回，不打开
+        text_display = self.file_tree.item(item_id, "text")
+        if text_display.startswith("📁"):
+            return
+        relative_path = self.file_tree.item(item_id)["values"][0]
         file_path = WORKSPACE / relative_path
         try:
             content = file_path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
-            messagebox.showerror("无法打开", "该文件不是 UTF-8 文本文件。")
+            messagebox.showerror("无法打开", "该文件不是 UTF‑8 文本文件。")
             return
         except OSError as exc:
             messagebox.showerror("无法打开", str(exc))
